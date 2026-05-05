@@ -72,7 +72,7 @@ gcloud run jobs create "$JOB_NAME" \
   --set-env-vars TIMEOUT_SECONDS="30" \
   --set-env-vars LOG_EACH_REQUEST="true" \
   --set-env-vars PROGRESS_INTERVAL_SECONDS="30" \
-  --set-secrets HL7_BEARER_TOKEN=HL7_BEARER_TOKEN:latest
+  --set-env-vars HL7_BEARER_TOKEN="$HL7_BEARER_TOKEN"
 ```
 
 Notes:
