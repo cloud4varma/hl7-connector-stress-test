@@ -29,7 +29,7 @@ import base64
 import random
 import requests
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 URL = os.getenv("TARGET_URL")
 TOKEN = os.getenv("HL7_BEARER_TOKEN")
@@ -209,6 +209,11 @@ def main():
     )
 
     start_time = time.time()
+    # Hard deadline: the job must finish collecting results by this wall-clock time.
+    # We allow one extra TIMEOUT_SECONDS window beyond DURATION_SECONDS for in-flight
+    # requests to land, then we cancel everything and move on.
+    hard_deadline = start_time + DURATION_SECONDS + TIMEOUT_SECONDS
+
     request_number = 0
     scheduled_requests = 0.0
     last_progress_second = -1
@@ -218,9 +223,13 @@ def main():
     failure_count = 0
     latencies = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
+    # Keep a bounded set of in-flight futures so the list never grows to 115k entries.
+    # When it hits MAX_WORKERS we wait for at least one to finish before submitting more.
+    inflight: set = set()
 
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+
+        # ── submission loop ──────────────────────────────────────────────────────
         while True:
             elapsed = time.time() - start_time
             if elapsed >= DURATION_SECONDS:
@@ -234,8 +243,22 @@ def main():
             scheduled_requests -= to_send
 
             for _ in range(to_send):
+                # Back-pressure: drain one completed future before adding a new one
+                # when the pool is saturated. This keeps `inflight` bounded at ~MAX_WORKERS
+                # and prevents the list from ballooning to 115k entries.
+                while len(inflight) >= MAX_WORKERS:
+                    done, inflight = wait(inflight, timeout=0.05, return_when=FIRST_COMPLETED)
+                    for f in done:
+                        success, latency_ms = f.result()
+                        completed += 1
+                        latencies.append(latency_ms)
+                        if success:
+                            success_count += 1
+                        else:
+                            failure_count += 1
+
                 request_number += 1
-                futures.append(executor.submit(send_request, request_number))
+                inflight.add(executor.submit(send_request, request_number))
 
             current_second = int(elapsed)
             if (
@@ -251,25 +274,37 @@ def main():
                     elapsed_seconds=round(elapsed, 1),
                     current_target_rpm=round(rpm, 2),
                     submitted_requests=request_number,
-                    inflight_or_pending_futures=len(futures),
+                    inflight_futures=len(inflight),
+                    completed_so_far=completed,
                 )
 
             time.sleep(0.1)
 
+        # ── drain phase: collect remaining in-flight futures, but respect the hard deadline ──
         log_json(
             "INFO",
             "waiting_for_inflight_requests",
             submitted_requests=request_number,
+            inflight_remaining=len(inflight),
         )
 
-        for future in futures:
-            success, latency_ms = future.result()
+        for future in as_completed(inflight, timeout=max(0, hard_deadline - time.time())):
+            try:
+                success, latency_ms = future.result()
+            except Exception as e:
+                log_json("ERROR", "future_result_error", error=str(e))
+                success, latency_ms = False, 0.0
             completed += 1
             latencies.append(latency_ms)
             if success:
                 success_count += 1
             else:
                 failure_count += 1
+
+        # Cancel anything still pending after the hard deadline (shouldn't happen normally)
+        cancelled = sum(1 for f in inflight if not f.done() and f.cancel())
+        if cancelled:
+            log_json("WARNING", "futures_cancelled_at_deadline", count=cancelled)
 
     total_time = time.time() - start_time
     sorted_latencies = sorted(latencies)
