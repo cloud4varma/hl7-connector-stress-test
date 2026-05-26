@@ -2,8 +2,8 @@
 HL7 Stress Test Job
 
 Author: Datla Sai Krishna Varma
-Version: 1.0
-Last Updated: 05-05-2026
+Version: 1.0.2
+Last Updated: 26-05-2026
 
 Description:
 This script performs high-throughput stress testing by generating synthetic HL7 messages,
@@ -209,9 +209,6 @@ def main():
     )
 
     start_time = time.time()
-    # Hard deadline: the job must finish collecting results by this wall-clock time.
-    # We allow one extra TIMEOUT_SECONDS window beyond DURATION_SECONDS for in-flight
-    # requests to land, then we cancel everything and move on.
     hard_deadline = start_time + DURATION_SECONDS + TIMEOUT_SECONDS
 
     request_number = 0
@@ -223,8 +220,7 @@ def main():
     failure_count = 0
     latencies = []
 
-    # Keep a bounded set of in-flight futures so the list never grows to 115k entries.
-    # When it hits MAX_WORKERS we wait for at least one to finish before submitting more.
+    
     inflight: set = set()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -243,11 +239,10 @@ def main():
             scheduled_requests -= to_send
 
             for _ in range(to_send):
-                # Back-pressure: drain one completed future before adding a new one
-                # when the pool is saturated. This keeps `inflight` bounded at ~MAX_WORKERS
-                # and prevents the list from ballooning to 115k entries.
+   
                 while len(inflight) >= MAX_WORKERS:
-                    done, inflight = wait(inflight, timeout=0.05, return_when=FIRST_COMPLETED)
+                    done, not_done = wait(inflight, timeout=0.05, return_when=FIRST_COMPLETED)
+                    inflight = not_done
                     for f in done:
                         success, latency_ms = f.result()
                         completed += 1
@@ -280,7 +275,7 @@ def main():
 
             time.sleep(0.1)
 
-        # ── drain phase: collect remaining in-flight futures, but respect the hard deadline ──
+        
         log_json(
             "INFO",
             "waiting_for_inflight_requests",
@@ -301,7 +296,7 @@ def main():
             else:
                 failure_count += 1
 
-        # Cancel anything still pending after the hard deadline (shouldn't happen normally)
+        # Cancel anything still pending after the hard deadline
         cancelled = sum(1 for f in inflight if not f.done() and f.cancel())
         if cancelled:
             log_json("WARNING", "futures_cancelled_at_deadline", count=cancelled)
